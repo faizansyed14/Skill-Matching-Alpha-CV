@@ -1,0 +1,8 @@
+streamlit
+sentence-transformers
+numpy
+pandas
+qdrant-client
+scipy
+graphviz
+plotly
