@@ -117,7 +117,7 @@ def load_model():
 # ---------------------------
 # Dashboard Layout
 # ---------------------------
-st.title("🔎 Skill Matching Dashboard")
+st.title("🔎 Alpha CV Skill Matching")
 st.markdown("This tool uses the **Hungarian algorithm** to find the optimal one-to-one assignment between job description (JD) skills and CV skills, based on their semantic similarity.")
 st.markdown("---")
 
@@ -444,3 +444,4 @@ if st.session_state.run_analysis:
             )
             st.dataframe(df_matched.style.format({"Score": "{:.3f}"}), use_container_width=True)
             st.divider()
+
