@@ -6,3 +6,7 @@ qdrant-client
 scipy
 graphviz
 plotly
+pdfplumber
+docx2txt
+python-dotenv
+openai>=1.0.0
