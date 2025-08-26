@@ -5,7 +5,7 @@
 #    • Multiple-file uploads for CVs and single JD upload
 #    • Automatic text extraction (PDF/DOCX/TXT)
 #    • LLM-powered structured extraction with strict prompts (CV + JD)
-#    • API key loaded from .env or Streamlit secrets (OPENAI_API_KEY)
+#    • API key loaded from .env or Streamlit secrets (OPENAI_API_KEY, GEMINI_API_KEY)
 #    • Shows per-request time taken and token counts in UI
 #    • Customizable weights + modern UI
 #    • Matching logic identical to your app (with multi-CV index fix)
@@ -16,10 +16,11 @@
 #    • 🔽 NEW: Refresh button to reset all data
 #    • 🔽 NEW: Improved UI with JD on left and CVs on right for comparison
 #    • 🔽 NEW: Simplified extraction logs showing only model, time, and tokens
+#    • 🔽 NEW: Added Google Gemini models support
 # ------------------------------------------------------------
 # Requirements (pip):
 # streamlit, numpy, pandas, sentence-transformers, qdrant-client, scipy, graphviz, plotly,
-# pdfplumber, docx2txt, python-dotenv, openai>=1.0.0
+# pdfplumber, docx2txt, python-dotenv, openai>=1.0.0, google-generativeai
 # ------------------------------------------------------------
 import os
 import io
@@ -33,6 +34,7 @@ import graphviz
 import plotly.graph_objects as go
 import streamlit as st
 import openai  # ONLY this import for OpenAI SDK
+import google.generativeai as genai  # Added for Gemini
 from dotenv import load_dotenv, find_dotenv
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -47,11 +49,15 @@ GOOD_THRESHOLD = 0.40  # Threshold for good matches
 DEFAULT_MODEL = "gpt-4o-mini"
 # 🔽 NEW: model presets (temperature per model) — tweak as you like
 MODEL_PRESETS = {
-    "gpt-5-nano":   {"temperature": 1, "note": "Deterministic, tiny"},
-    "gpt-5-mini":   {"temperature": 1, "note": "Small, slightly flexible"},
+    # 🔽 OpenAI Models
+    "gpt-4o-mini": {"temperature": 0.0, "note": "Vision-optimized mini (deterministic)"},
     "gpt-4.1-mini": {"temperature": 0.0, "note": "Balanced mini"},
-    "gpt-4o-mini":  {"temperature": 0.0, "note": "Vision-optimized mini (deterministic)"},
+    "gpt-5-mini": {"temperature": 1.0, "note": "Small, slightly flexible"},
+    "gpt-5-nano": {"temperature": 1.0, "note": "Deterministic, tiny"},
     "gpt-4.1-nano": {"temperature": 0.0, "note": "Ultra-tiny, deterministic"},
+    # 🔽 Gemini 1.5 Models (most advanced publicly available)
+    "gemini-1.5-pro-latest": {"temperature": 0.0, "note": "Latest Gemini 1.5 Pro"},
+    "gemini-1.5-flash-latest": {"temperature": 0.0, "note": "Latest Gemini 1.5 Flash"},
 }
 st.set_page_config(
     page_title="Alpha CV Matcher",
@@ -60,21 +66,28 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 # ---------------------------
-# .env load + OpenAI setup (only import openai)
+# .env load + OpenAI/Gemini setup
 # ---------------------------
 ENV_PATH = find_dotenv(usecwd=True)
 load_dotenv(ENV_PATH, override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 try:
-    secret_key = st.secrets.get("OPENAI_API_KEY", None)
+    secret_openai_key = st.secrets.get("OPENAI_API_KEY", None)
+    secret_gemini_key = st.secrets.get("GEMINI_API_KEY", None)
 except Exception:
-    secret_key = None
-if not OPENAI_API_KEY and secret_key:
-    OPENAI_API_KEY = secret_key
+    secret_openai_key = None
+    secret_gemini_key = None
+if not OPENAI_API_KEY and secret_openai_key:
+    OPENAI_API_KEY = secret_openai_key
+if not GEMINI_API_KEY and secret_gemini_key:
+    GEMINI_API_KEY = secret_gemini_key
 OPENAI_AVAILABLE = True
 OPENAI_IMPORT_ERROR = None
 CLIENT_AVAILABLE = hasattr(openai, "Client")
 LEGACY_AVAILABLE = hasattr(openai, "ChatCompletion")
+GEMINI_AVAILABLE = True
+GEMINI_IMPORT_ERROR = None
 # ---------------------------
 # Authentication Setup
 # ---------------------------
@@ -417,6 +430,22 @@ st.markdown("""
     .log-table tr:hover {
         background-color: rgba(102,126,234,0.05);
     }
+    .model-badge {
+        display: inline-block;
+        padding: 0.25rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        margin-left: 0.5rem;
+    }
+    .model-openai {
+        background-color: rgba(0, 123, 255, 0.1);
+        color: #007bff;
+    }
+    .model-gemini {
+        background-color: rgba(234, 67, 53, 0.1);
+        color: #ea4335;
+    }
 </style>
 """, unsafe_allow_html=True)
 # Add logout button to the sidebar
@@ -432,51 +461,28 @@ else:
 # Default Prompts (can be edited from UI)
 # ---------------------------
 DEFAULT_CV_PROMPT = """You are an information-extraction engine. You will receive the full plain text of ONE resume/CV.
-
 Your job is to output STRICT JSON with the following schema, extracting:
-
 Candidate NAME
-
 Exactly 20 SKILL PHRASES (by reviewing the full CV and understanding the skills possessed by this candidate; if fewer than 20 exist, leave the remaining slots as "").
-
 Exactly 10 RESPONSIBILITY PHRASES (from WORK EXPERIENCE / PROFESSIONAL EXPERIENCE sections; if fewer than 10, derive the remaining from CERTIFICATIONS or other professional sections, but never from skills).
-
 The most recent JOB TITLE.
-
 YEARS OF EXPERIENCE (total professional experience by seeing the date the candidate started working and taking a general calculation from start to present. do not calculate using code and you may infer from the text in the CV if you find phrases such as "15 years of experience").
-
 General Rules:
-
 Output valid JSON only. No markdown, no comments, no trailing commas.
-
 Use English only.
-
 Do not invent facts. If something is missing, leave empty strings "" or null.
-
 Arrays must be fixed length: skills_sentences = 20, responsibility_sentences = 10.
-
 De-duplicate near-duplicates (case-insensitive). Keep the most informative version.
-
 Each skill/responsibility must be a concise, descriptive phrase (not a full sentence).
-
 Example: "active directory security assessments to strengthen authentication and access controls"
-
 Avoid: "Performs active directory security assessments to strengthen authentication and access controls."
-
 Remove filler verbs such as performs, provides, carries out, responsible for, manages, oversees.
-
 Skills must be derived by reviewing the full document and understanding what skills the candidate possesses.
-
 Responsibilities must come only from EXPERIENCE/WORK HISTORY sections (and CERTIFICATIONS if needed).
-
 Expand acronyms into their full professional terms (e.g., AWS → Amazon Web Services, SQL → Structured Query Language). Apply consistently.
-
 Ensure skill and responsibility lists are domain-specific phrases only without generic wording.
-
 No duplication across skills and responsibilities.
-
 Output Format:
-
 {
   "doc_type": "resume",
   "name": string | null,
@@ -495,49 +501,27 @@ Output Format:
 }
 """
 DEFAULT_JD_PROMPT = """You are an information-extraction engine. You will receive the full plain text of ONE job description (JD).
-
 Your job is to output STRICT JSON with the following schema, extracting:
-
 Exactly 20 SKILL PHRASES (by preferring SKILLS, REQUIREMENTS, QUALIFICATIONS, TECHNOLOGY STACK sections, however read the full document and suggest what skills are required for this position; if fewer than 20 exist, create additional descriptive phrases from related requirements until 20 are filled).
-
 Exactly 10 RESPONSIBILITY PHRASES (from RESPONSIBILITIES, DUTIES, WHAT YOU’LL DO sections; if fewer than 10 exist, expand implied responsibilities until 10 are filled).
-
 The JOB TITLE of the role.
-
 YEARS OF EXPERIENCE (minimum required, if explicitly stated; if a range is given, use the minimum).
-
 General Rules:
-
 Output valid JSON only. No markdown, no comments, no trailing commas.
-
 Use English only.
-
 Do not invent facts. If something is missing, leave empty strings "" or null.
-
 Arrays must be fixed length: skills_sentences = 20, responsibility_sentences = 10.
-
 De-duplicate near-duplicates (case-insensitive). Keep the most informative version.
-
 Each skill/responsibility must be a concise, descriptive phrase (not a full sentence).
-
 Example: "structured query language database administration"
-
 Avoid: "Uses Structured Query Language to administer relational databases."
-
 Remove filler verbs such as develops, implements, provides, generates, manages, responsible for.
-
 Skills should come from SKILLS/REQUIREMENTS/QUALIFICATIONS sections, however review the full document and suggest the skills required for this position.
-
 Responsibilities should come from RESPONSIBILITIES/DUTIES/WHAT YOU’LL DO sections.
-
 Expand acronyms into their full professional terms (e.g., CRM → Customer Relationship Management, API → Application Programming Interface). Apply consistently.
-
 Ensure skills and responsibilities remain short, embedding-friendly phrases with no generic filler wording.
-
 Skills and responsibilities must remain distinct, with no overlap.
-
 Output Format:
-
 {
   "doc_type": "job_description",
   "job_title": string | null,
@@ -645,54 +629,113 @@ if "model_name" not in st.session_state:
 if "model_temp" not in st.session_state:
     st.session_state.model_temp = MODEL_PRESETS.get(DEFAULT_MODEL, {"temperature": 0.0})["temperature"]
 # ---------------------------
-# OpenAI call wrapper (supports modern & legacy)
+# OpenAI/Gemini call wrapper
 # ---------------------------
 def _create_chat_completion(model_name, messages, response_format_json=True, temperature=0):
     """
     Returns: (resp_obj_or_dict, duration_seconds, error)
     """
-    if not OPENAI_API_KEY:
-        return None, 0.0, "OPENAI_API_KEY not found (set it in .env or Streamlit secrets)"
     t0 = time.perf_counter()
-    try:
-        if CLIENT_AVAILABLE:
-            client = openai.Client(api_key=OPENAI_API_KEY)
-            kwargs = {"model": model_name, "messages": messages, "temperature": float(temperature)}
-            if response_format_json:
-                kwargs["response_format"] = {"type": "json_object"}
-            resp = client.chat.completions.create(**kwargs)
+    
+    # Check if it's a Gemini model
+    if model_name.startswith("gemini-"):
+        if not GEMINI_API_KEY:
+            return None, 0.0, "GEMINI_API_KEY not found (set it in .env or Streamlit secrets)"
+        
+        try:
+            # Configure Gemini
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel(model_name)
+            
+            # Combine all messages into one content string
+            full_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    full_content += f"System: {msg['content']}\n\n"
+                elif msg["role"] == "user":
+                    full_content += f"User: {msg['content']}\n\n"
+            
+            # Generate content
+            response = model.generate_content(
+                full_content,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=temperature,
+                )
+            )
+            
             dt = time.perf_counter() - t0
-            return resp, dt, None
-        elif LEGACY_AVAILABLE:
-            openai.api_key = OPENAI_API_KEY
-            kwargs = {"model": model_name, "messages": messages, "temperature": float(temperature)}
-            try:
+            
+            # Create a response object similar to OpenAI's structure
+            resp_obj = {
+                "choices": [{"message": {"content": response.text}}],
+                "usage": {
+                    "prompt_tokens": response.usage_metadata.prompt_token_count if hasattr(response, 'usage_metadata') and response.usage_metadata else 0,
+                    "completion_tokens": response.usage_metadata.candidates_token_count if hasattr(response, 'usage_metadata') and response.usage_metadata else 0,
+                    "total_tokens": response.usage_metadata.total_token_count if hasattr(response, 'usage_metadata') and response.usage_metadata else 0,
+                }
+            }
+            
+            return resp_obj, dt, None
+            
+        except Exception as e:
+            dt = time.perf_counter() - t0
+            return None, dt, str(e)
+    
+    # Otherwise, use OpenAI
+    else:
+        if not OPENAI_API_KEY:
+            return None, 0.0, "OPENAI_API_KEY not found (set it in .env or Streamlit secrets)"
+        
+        try:
+            if CLIENT_AVAILABLE:
+                client = openai.Client(api_key=OPENAI_API_KEY)
+                kwargs = {"model": model_name, "messages": messages, "temperature": float(temperature)}
                 if response_format_json:
                     kwargs["response_format"] = {"type": "json_object"}
-                # Some legacy versions might ignore response_format
-            except Exception:
-                pass
-            resp = openai.ChatCompletion.create(**kwargs)
+                resp = client.chat.completions.create(**kwargs)
+                dt = time.perf_counter() - t0
+                return resp, dt, None
+            elif LEGACY_AVAILABLE:
+                openai.api_key = OPENAI_API_KEY
+                kwargs = {"model": model_name, "messages": messages, "temperature": float(temperature)}
+                try:
+                    if response_format_json:
+                        kwargs["response_format"] = {"type": "json_object"}
+                    # Some legacy versions might ignore response_format
+                except Exception:
+                    pass
+                resp = openai.ChatCompletion.create(**kwargs)
+                dt = time.perf_counter() - t0
+                return resp, dt, None
+            else:
+                return None, 0.0, "openai SDK is not available in this environment"
+        except Exception as e:
             dt = time.perf_counter() - t0
-            return resp, dt, None
-        else:
-            return None, 0.0, "openai SDK is not available in this environment"
-    except Exception as e:
-        dt = time.perf_counter() - t0
-        return None, dt, str(e)
+            return None, dt, str(e)
 def _extract_usage(resp):
     """
-    Normalize token usage for both modern and legacy responses.
+    Normalize token usage for both OpenAI and Gemini responses.
     """
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     if resp is None:
         return usage
+    
+    # Handle Gemini response (dict)
+    if isinstance(resp, dict):
+        u = resp.get("usage", {})
+        usage["prompt_tokens"] = u.get("prompt_tokens", 0) or 0
+        usage["completion_tokens"] = u.get("completion_tokens", 0) or 0
+        usage["total_tokens"] = u.get("total_tokens", 0) or 0
+        return usage
+    
+    # Handle OpenAI response (object)
     if hasattr(resp, "usage"):
         u = getattr(resp, "usage", None)
         usage["prompt_tokens"] = getattr(u, "prompt_tokens", 0) or 0
         usage["completion_tokens"] = getattr(u, "completion_tokens", 0) or 0
         usage["total_tokens"] = getattr(u, "total_tokens", 0) or 0
         return usage
+    
     try:
         if isinstance(resp, dict) and "usage" in resp:
             u = resp["usage"] or {}
@@ -701,18 +744,29 @@ def _extract_usage(resp):
             usage["total_tokens"] = int(u.get("total_tokens", 0))
     except Exception:
         pass
+    
     return usage
 def _extract_content(resp):
     """
-    Get message content from both modern and legacy responses.
+    Get message content from both OpenAI and Gemini responses.
     """
     if resp is None:
         return ""
+    
+    # Handle Gemini response (dict)
+    if isinstance(resp, dict):
+        try:
+            return resp["choices"][0]["message"]["content"]
+        except Exception:
+            return ""
+    
+    # Handle OpenAI response (object)
     if hasattr(resp, "choices"):
         try:
             return resp.choices[0].message.content
         except Exception:
             return ""
+    
     try:
         return resp["choices"][0]["message"]["content"]
     except Exception:
@@ -725,46 +779,50 @@ def llm_extract(text: str, which: str, model_name: str, temperature: float, prom
     which: "cv" or "jd"
     returns: (parsed_json, usage_dict, duration_seconds, raw_response_text, error)
     """
-    if not OPENAI_AVAILABLE:
-        return None, {"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}, 0.0, "", "OpenAI Python package not available"
-    if not OPENAI_API_KEY:
-        return None, {"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}, 0.0, "", "OPENAI_API_KEY not found"
+    if not OPENAI_AVAILABLE and not GEMINI_AVAILABLE:
+        return None, {"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}, 0.0, "", "Neither OpenAI nor Gemini package is available"
+    
     if not model_name:
         return None, {"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}, 0.0, "", "Model name is empty"
+    
     if prompt_override and isinstance(prompt_override, str) and prompt_override.strip():
         prompt = prompt_override
     else:
         prompt = DEFAULT_CV_PROMPT if which == "cv" else DEFAULT_JD_PROMPT
+    
     messages = [
         {"role": "system", "content": "You are a careful information-extraction engine. Output strict JSON only."},
         {"role": "user", "content": prompt},
         {"role": "user", "content": f"---\nBEGIN DOCUMENT\n{text}\nEND DOCUMENT\n---"}
     ]
+    
     resp, dt, err = _create_chat_completion(model_name, messages, response_format_json=True, temperature=temperature)
     if err:
         return None, {"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}, dt, "", err
+    
     raw = _extract_content(resp)
     usage = _extract_usage(resp)
     parsed = safe_json_loads(raw)
     if parsed is None:
         return None, usage, dt, raw, "Failed to parse JSON"
+    
     return parsed, usage, dt, raw, None
 # ---------------------------
 # Hero Header
 # ---------------------------
-col1, col2 = st.columns([3, 1])
+col1, _ = st.columns([1, 0.01])  # just keep one wide column
 with col1:
     st.markdown("""
-    <div class="hero-header">
-        <div>
-            <h1 class="hero-title">🎯 ALPHA CV Matcher</h1>
-            <p class="hero-subtitle">BETA Version 1.0</p>
-        </div>
+    <div class="hero-header" style="text-align:center;">
+        <h1 class="hero-title">🎯 ALPHA CV Matcher</h1>
+        <p class="hero-subtitle">BETA Version 1.0</p>
     </div>
     """, unsafe_allow_html=True)
-with col2:
+
+    # 🔄 Refresh button centered below the header
     if st.button("🔄 Refresh", key="refresh_button"):
         reset_session_state()
+
 # ---------------------------
 # Session state init (rest)
 # ---------------------------
@@ -792,45 +850,79 @@ if "prompts" not in st.session_state:
 # Tabs
 # ---------------------------
 tab1, tab2, tab3 = st.tabs(["⚙️ Customization", "📥 Upload & Extract", "📊 Results"])
+
 # =========================== TAB 1: CUSTOMIZATION ===========================
 with tab1:
-    st.subheader("🔐 OpenAI Status")
+    st.markdown("## 🔐 API Status")
+
     # 🔽 NEW: Model dropdown + automatic temp
     model_options = list(MODEL_PRESETS.keys())
     default_index = model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
-    colA, colB, colC, colD = st.columns([1.4, 0.9, 0.9, 1.1])
+
+    colA, colB = st.columns([1.5, 2])
     with colA:
-        selected_model = st.selectbox("Model", model_options, index=default_index, key="model_name")
-        # Update temperature from preset when model changes
+        selected_model = st.selectbox("Select Model", model_options, index=default_index, key="model_name")
         st.session_state.model_temp = MODEL_PRESETS.get(selected_model, {"temperature": 0.0})["temperature"]
-    with colB:
-        ok_pkg = "✅" if OPENAI_AVAILABLE else "❌"
-        ok_key = "✅" if bool(OPENAI_API_KEY) else "❌"
-        st.write(f"Package import: {ok_pkg}")
-        st.write(f"API key loaded: {ok_key}")
-    with colC:
-        masked = (OPENAI_API_KEY[:7] + "..." + OPENAI_API_KEY[-4:]) if OPENAI_API_KEY else "—"
-        st.write("Key:")
-        st.code(masked, language="bash")
-    with colD:
+
+        # Add styled badge for provider
+        model_type = "OpenAI" if not selected_model.startswith("gemini-") else "Gemini"
+        badge_color = "#007bff" if model_type == "OpenAI" else "#ea4335"
+        st.markdown(
+            f"""
+            <div style="margin-top:10px; display:inline-block; 
+                        padding:4px 10px; border-radius:8px; 
+                        background-color:{badge_color}; color:white; 
+                        font-weight:600; font-size:0.85rem;">
+                {model_type} Model
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
         st.metric("Temperature (auto)", f"{st.session_state.model_temp:.2f}")
-    # Optional: show all presets for clarity
-    with st.expander("ℹ️ Model presets (temperature per model)"):
-        df_presets = pd.DataFrame([
-            {"Model": m, "Temperature": v["temperature"], "Note": v.get("note", "")}
-            for m, v in MODEL_PRESETS.items()
-        ])
-        st.dataframe(df_presets, use_container_width=True, hide_index=True)
-    test_col1, test_col2 = st.columns([1,2])
-    with test_col1:
-        if st.button("🧪 Test OpenAI call"):
+
+    with colB:
+        # API connection cards
+        openai_ok_pkg = "✅" if OPENAI_AVAILABLE else "❌"
+        openai_ok_key = "✅" if bool(OPENAI_API_KEY) else "❌"
+        gemini_ok_pkg = "✅" if GEMINI_AVAILABLE else "❌"
+        gemini_ok_key = "✅" if bool(GEMINI_API_KEY) else "❌"
+
+        st.markdown(
+            f"""
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-top:0.5rem;">
+                <div style="padding:12px; border-radius:10px; background:rgba(0,123,255,0.08);">
+                    <h4 style="margin:0; color:#007bff;">OpenAI</h4>
+                    <p style="margin:4px 0;">📦 Package: {openai_ok_pkg}</p>
+                    <p style="margin:4px 0;">🔑 API Key: {openai_ok_key}</p>
+                    <code style="font-size:0.8rem;">{(OPENAI_API_KEY[:2] + "..." + OPENAI_API_KEY[-1:]) if OPENAI_API_KEY else "—"}</code>
+                </div>
+                <div style="padding:12px; border-radius:10px; background:rgba(234,67,53,0.08);">
+                    <h4 style="margin:0; color:#ea4335;">Gemini</h4>
+                    <p style="margin:4px 0;">📦 Package: {gemini_ok_pkg}</p>
+                    <p style="margin:4px 0;">🔑 API Key: {gemini_ok_key}</p>
+                    <code style="font-size:0.8rem;">{(GEMINI_API_KEY[:2] + "..." + GEMINI_API_KEY[-1:]) if GEMINI_API_KEY else "—"}</code>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+  
+
+    # Test API call button
+    st.markdown("### 🧪 Test API Connection")
+    if st.button("▶️ Run Test"):
+        model_type = "OpenAI" if not selected_model.startswith("gemini-") else "Gemini"
+        if model_type == "OpenAI":
             if not OPENAI_AVAILABLE:
-                st.error("OpenAI package not importable. Try: pip install --upgrade openai")
+                st.error("❌ OpenAI package not importable. Run: `pip install --upgrade openai`")
             elif not OPENAI_API_KEY:
-                st.error("OPENAI_API_KEY not found. Add it to .env or Streamlit secrets.")
+                st.error("❌ OPENAI_API_KEY missing in `.env` or Streamlit secrets.")
             else:
                 try:
-                    messages=[{"role":"system","content":"Reply with JSON {\"ok\":true} and nothing else."}]
+                    messages = [{"role":"system","content":"Reply with JSON {\"ok\":true} and nothing else."}]
                     resp, _, err = _create_chat_completion(
                         st.session_state.model_name,
                         messages,
@@ -838,11 +930,32 @@ with tab1:
                         temperature=st.session_state.model_temp
                     )
                     if err:
-                        st.error(f"OpenAI call failed: {err}")
+                        st.error(f"❌ OpenAI call failed: {err}")
                     else:
-                        st.success(f"OK! Model responded. Temp: {st.session_state.model_temp:.2f}  •  Usage: {_extract_usage(resp)}")
+                        st.success(f"✅ OpenAI is working! Usage: {_extract_usage(resp)}")
                 except Exception as e:
-                    st.error(f"OpenAI call failed: {e}")
+                    st.error(f"❌ OpenAI call failed: {e}")
+        else:  # Gemini
+            if not GEMINI_AVAILABLE:
+                st.error("❌ Gemini package not importable. Run: `pip install --upgrade google-generativeai`")
+            elif not GEMINI_API_KEY:
+                st.error("❌ GEMINI_API_KEY missing in `.env` or Streamlit secrets.")
+            else:
+                try:
+                    messages = [{"role":"system","content":"Reply with JSON {\"ok\":true} and nothing else."}]
+                    resp, _, err = _create_chat_completion(
+                        st.session_state.model_name,
+                        messages,
+                        response_format_json=True,
+                        temperature=st.session_state.model_temp
+                    )
+                    if err:
+                        st.error(f"❌ Gemini call failed: {err}")
+                    else:
+                        st.success(f"✅ Gemini is working! Usage: {_extract_usage(resp)}")
+                except Exception as e:
+                    st.error(f"❌ Gemini call failed: {e}")
+
     st.markdown("---")
     st.subheader("📊 Weights")
     c1, c2, c3, c4 = st.columns(4)
