@@ -55,10 +55,13 @@ MODEL_PRESETS = {
     "gpt-5-mini": {"temperature": 1.0, "note": "Small, slightly flexible"},
     "gpt-5-nano": {"temperature": 1.0, "note": "Deterministic, tiny"},
     "gpt-4.1-nano": {"temperature": 0.0, "note": "Ultra-tiny, deterministic"},
-    # Gemini 2.5 family (GA)
+    # 🔽 Gemini 1.5 Models (most advanced publicly available)
+
     "gemini-2.5-flash": {"temperature": 0.0, "note": "2.5 Flash – balanced, GA"},
     "gemini-2.5-pro": {"temperature": 0.0, "note": "2.5 Pro – reasoning, GA"},
     "gemini-2.5-flash-lite": {"temperature": 0.0, "note": "2.5 Flash Lite – fastest, GA"},
+
+    # Gemini 2.0 (still available)
     "gemini-2.0-flash": {"temperature": 0.0, "note": "2.0 Flash"},
 }
 st.set_page_config(
@@ -630,6 +633,10 @@ if "model_name" not in st.session_state:
     st.session_state.model_name = DEFAULT_MODEL
 if "model_temp" not in st.session_state:
     st.session_state.model_temp = MODEL_PRESETS.get(DEFAULT_MODEL, {"temperature": 0.0})["temperature"]
+# 🔽 NEW: Reasoning Effort (for GPT-5 models only)
+if "reasoning_effort" not in st.session_state:
+    st.session_state.reasoning_effort = "minimal"
+
 # ---------------------------
 # OpenAI/Gemini call wrapper
 # ---------------------------
@@ -692,6 +699,11 @@ def _create_chat_completion(model_name, messages, response_format_json=True, tem
             if CLIENT_AVAILABLE:
                 client = openai.Client(api_key=OPENAI_API_KEY)
                 kwargs = {"model": model_name, "messages": messages, "temperature": float(temperature)}
+
+                # 🔽 Apply reasoning_effort for GPT-5 models
+                if model_name.startswith("gpt-5"):
+                    kwargs["reasoning_effort"] = st.session_state.get("reasoning_effort", "minimal")
+
                 if response_format_json:
                     kwargs["response_format"] = {"type": "json_object"}
                 resp = client.chat.completions.create(**kwargs)
@@ -865,6 +877,23 @@ with tab1:
     with colA:
         selected_model = st.selectbox("Select Model", model_options, index=default_index, key="model_name")
         st.session_state.model_temp = MODEL_PRESETS.get(selected_model, {"temperature": 0.0})["temperature"]
+        # 🔽 Show reasoning effort dropdown only for GPT-5 models
+        if selected_model.startswith("gpt-5"):
+            st.selectbox(
+                "Reasoning Effort (GPT-5 only)",
+                ["minimal", "low", "medium", "high"],
+                index=["minimal", "low", "medium", "high"].index(st.session_state.reasoning_effort),
+                key="reasoning_effort"
+            )
+            st.markdown(
+                f"<div style='margin-top:5px; font-size:0.9rem; color:#666;'>"
+                f"⚡ Current effort set to <strong>{st.session_state.reasoning_effort}</strong>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+
+
 
         # Add styled badge for provider
         model_type = "OpenAI" if not selected_model.startswith("gemini-") else "Gemini"
@@ -1800,4 +1829,3 @@ with tab3:
             </p>
         </div>
         """, unsafe_allow_html=True)
-
