@@ -59,10 +59,7 @@ MODEL_PRESETS = {
     "gemini-2.5-flash": {"temperature": 0.0, "note": "2.5 Flash – balanced, GA"},
     "gemini-2.5-pro": {"temperature": 0.0, "note": "2.5 Pro – reasoning, GA"},
     "gemini-2.5-flash-lite": {"temperature": 0.0, "note": "2.5 Flash Lite – fastest, GA"},
-
-    # Gemini 2.0 (still available)
     "gemini-2.0-flash": {"temperature": 0.0, "note": "2.0 Flash"},
-    "gemini-2.0-pro": {"temperature": 0.0, "note": "2.0 Pro (experimental)"},
 }
 st.set_page_config(
     page_title="Alpha CV Matcher",
@@ -1803,3 +1800,4 @@ with tab3:
             </p>
         </div>
         """, unsafe_allow_html=True)
+
