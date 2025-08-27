@@ -55,9 +55,14 @@ MODEL_PRESETS = {
     "gpt-5-mini": {"temperature": 1.0, "note": "Small, slightly flexible"},
     "gpt-5-nano": {"temperature": 1.0, "note": "Deterministic, tiny"},
     "gpt-4.1-nano": {"temperature": 0.0, "note": "Ultra-tiny, deterministic"},
-    # 🔽 Gemini 1.5 Models (most advanced publicly available)
-    "gemini-1.5-pro-latest": {"temperature": 0.0, "note": "Latest Gemini 1.5 Pro"},
-    "gemini-1.5-flash-latest": {"temperature": 0.0, "note": "Latest Gemini 1.5 Flash"},
+    # Gemini 2.5 family (GA)
+    "gemini-2.5-flash": {"temperature": 0.0, "note": "2.5 Flash – balanced, GA"},
+    "gemini-2.5-pro": {"temperature": 0.0, "note": "2.5 Pro – reasoning, GA"},
+    "gemini-2.5-flash-lite": {"temperature": 0.0, "note": "2.5 Flash Lite – fastest, GA"},
+
+    # Gemini 2.0 (still available)
+    "gemini-2.0-flash": {"temperature": 0.0, "note": "2.0 Flash"},
+    "gemini-2.0-pro": {"temperature": 0.0, "note": "2.0 Pro (experimental)"},
 }
 st.set_page_config(
     page_title="Alpha CV Matcher",
