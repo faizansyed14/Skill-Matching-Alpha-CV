@@ -20,12 +20,15 @@
 # ------------------------------------------------------------
 # Requirements (pip):
 # streamlit, numpy, pandas, sentence-transformers, qdrant-client, scipy, graphviz, plotly,
-# pdfplumber, docx2txt, python-dotenv, openai>=1.0.0, google-generativeai
+# pdfplumber, docx2txt, python-dotenv, openai>=1.0.0, google-generativeai, requests
 # ------------------------------------------------------------
 import os
 import io
 import json
 import time
+import hashlib
+import logging
+import requests
 import pdfplumber
 import docx2txt
 import numpy as np
@@ -40,27 +43,147 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from scipy.optimize import linear_sum_assignment
+from typing import Dict, Any, Optional, Tuple
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------------------
+# LLMService Class
+# ---------------------------
+class LLMService:
+    def __init__(self):
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+        # Pinned snapshot (override with env). Avoid floating aliases for stability.
+        self.default_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini-2025-04-14")
+        # Determinism knobs
+        self.seed = int(os.getenv("OPENAI_SEED", "1337"))
+        self.max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+        self.base_delay = float(os.getenv("OPENAI_RETRY_BASE_DELAY", "0.5"))
+        # Cache on disk (works across restarts)
+        self.cache_dir = os.getenv("LLM_CACHE_DIR", ".llm_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        # Endpoint & session
+        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        })
+        logger.info("🧠 LLMService initialized (deterministic & cached)")
+
+    def _get_cache_key(self, model: str, messages: list, temperature: float, json_schema: Optional[Dict] = None) -> str:
+        """Generate a cache key based on request parameters."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "json_schema": json_schema
+        }
+        payload_str = json.dumps(payload, sort_keys=True)
+        return hashlib.md5(payload_str.encode()).hexdigest()
+
+    def _get_cached_response(self, cache_key: str) -> Optional[Dict]:
+        """Retrieve cached response if available."""
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read cache: {e}")
+        return None
+
+    def _cache_response(self, cache_key: str, response: Dict) -> None:
+        """Cache the response."""
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(response, f)
+        except Exception as e:
+            logger.warning(f"Failed to write cache: {e}")
+
+    def chat_completion(self, model: str, messages: list, temperature: float = 0.0, 
+                       json_schema: Optional[Dict] = None) -> Tuple[Optional[Dict], float, Optional[str]]:
+        """
+        Make a chat completion request with retries and caching.
+        
+        Returns:
+            Tuple of (response_dict, duration_seconds, error_message)
+        """
+        cache_key = self._get_cache_key(model, messages, temperature, json_schema)
+        
+        # Check cache first
+        cached_response = self._get_cached_response(cache_key)
+        if cached_response:
+            logger.info("Using cached response")
+            return cached_response, 0.0, None
+        
+        # Prepare request payload
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "seed": self.seed
+        }
+        
+        # Add JSON schema if provided
+        if json_schema:
+            payload["response_format"] = {"type": "json_object", "json_schema": json_schema}
+        elif json_schema is not None:  # Explicitly request JSON object
+            payload["response_format"] = {"type": "json_object"}
+        
+        # Make request with retries
+        start_time = time.time()
+        last_error = None
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.post(self.base_url, json=payload)
+                response.raise_for_status()
+                response_data = response.json()
+                
+                # Cache the successful response
+                self._cache_response(cache_key, response_data)
+                
+                duration = time.time() - start_time
+                return response_data, duration, None
+                
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+                if attempt < self.max_retries:
+                    delay = self.base_delay * (2 ** attempt)
+                    logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries + 1}), retrying in {delay}s: {e}")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Request failed after {self.max_retries + 1} attempts: {e}")
+        
+        duration = time.time() - start_time
+        return None, duration, last_error
+
 # ---------------------------
 # Config
 # ---------------------------
 COLLECTION_NAME = "cv_skills"
 RESP_COLLECTION_NAME = "cv_responsibilities"
 GOOD_THRESHOLD = 0.40  # Threshold for good matches
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4.1-mini-2025-04-14"  # Updated default model
 # 🔽 NEW: model presets (temperature per model) — tweak as you like
 MODEL_PRESETS = {
     # 🔽 OpenAI Models
+    "gpt-4.1-mini-2025-04-14": {"temperature": 0.0, "note": "Stable mini model (deterministic)"},
     "gpt-4o-mini": {"temperature": 0.0, "note": "Vision-optimized mini (deterministic)"},
     "gpt-4.1-mini": {"temperature": 0.0, "note": "Balanced mini"},
     "gpt-5-mini": {"temperature": 1.0, "note": "Small, slightly flexible"},
     "gpt-5-nano": {"temperature": 1.0, "note": "Deterministic, tiny"},
     "gpt-4.1-nano": {"temperature": 0.0, "note": "Ultra-tiny, deterministic"},
     # 🔽 Gemini 1.5 Models (most advanced publicly available)
-
     "gemini-2.5-flash": {"temperature": 0.0, "note": "2.5 Flash – balanced, GA"},
     "gemini-2.5-pro": {"temperature": 0.0, "note": "2.5 Pro – reasoning, GA"},
     "gemini-2.5-flash-lite": {"temperature": 0.0, "note": "2.5 Flash Lite – fastest, GA"},
-
     # Gemini 2.0 (still available)
     "gemini-2.0-flash": {"temperature": 0.0, "note": "2.0 Flash"},
 }
@@ -93,6 +216,15 @@ CLIENT_AVAILABLE = hasattr(openai, "Client")
 LEGACY_AVAILABLE = hasattr(openai, "ChatCompletion")
 GEMINI_AVAILABLE = True
 GEMINI_IMPORT_ERROR = None
+
+# Initialize LLMService for OpenAI models
+llm_service = None
+if OPENAI_API_KEY:
+    try:
+        llm_service = LLMService()
+    except Exception as e:
+        logger.error(f"Failed to initialize LLMService: {e}")
+
 # ---------------------------
 # Authentication Setup
 # ---------------------------
@@ -463,7 +595,7 @@ if st.session_state.logged_in:
 else:
     st.write("Please log in to continue.")
 # ---------------------------
-# Default Prompts (can be edited from UI)
+# Default Prompts (updated)
 # ---------------------------
 DEFAULT_CV_PROMPT = """You are an information-extraction engine. You will receive the full plain text of ONE resume/CV.
 Your job is to output STRICT JSON with the following schema, extracting:
@@ -471,7 +603,7 @@ Candidate NAME
 Exactly 20 SKILL PHRASES (by reviewing the full CV and understanding the skills possessed by this candidate; if fewer than 20 exist, leave the remaining slots as "").
 Exactly 10 RESPONSIBILITY PHRASES (from WORK EXPERIENCE / PROFESSIONAL EXPERIENCE sections; if fewer than 10, derive the remaining from CERTIFICATIONS or other professional sections, but never from skills).
 The most recent JOB TITLE.
-YEARS OF EXPERIENCE (total professional experience by seeing the date the candidate started working and taking a general calculation from start to present. do not calculate using code and you may infer from the text in the CV if you find phrases such as "15 years of experience").
+YEARS OF EXPERIENCE (total professional experience by seeing the date the candidate started working and taking a general calculation from start to present; you may infer from phrases like "15 years of experience").
 General Rules:
 Output valid JSON only. No markdown, no comments, no trailing commas.
 Use English only.
@@ -502,13 +634,14 @@ Output Format:
     "<Responsibility phrase 1>",
     "... (total 10 items)",
     ""
-  ]
+  ],
+  "contact_info": {"name": string | null}
 }
 """
 DEFAULT_JD_PROMPT = """You are an information-extraction engine. You will receive the full plain text of ONE job description (JD).
 Your job is to output STRICT JSON with the following schema, extracting:
-Exactly 20 SKILL PHRASES (by preferring SKILLS, REQUIREMENTS, QUALIFICATIONS, TECHNOLOGY STACK sections, however read the full document and suggest what skills are required for this position; if fewer than 20 exist, create additional descriptive phrases from related requirements until 20 are filled).
-Exactly 10 RESPONSIBILITY PHRASES (from RESPONSIBILITIES, DUTIES, WHAT YOU’LL DO sections; if fewer than 10 exist, expand implied responsibilities until 10 are filled).
+Exactly 20 SKILL PHRASES (prefer SKILLS, REQUIREMENTS, QUALIFICATIONS, TECHNOLOGY STACK sections; read the full document. If fewer than 20 exist, leave remaining slots as "").
+Exactly 10 RESPONSIBILITY PHRASES (from RESPONSIBILITIES, DUTIES, WHAT YOU’LL DO sections; if fewer than 10 exist, leave remaining slots as "").
 The JOB TITLE of the role.
 YEARS OF EXPERIENCE (minimum required, if explicitly stated; if a range is given, use the minimum).
 General Rules:
@@ -521,7 +654,7 @@ Each skill/responsibility must be a concise, descriptive phrase (not a full sent
 Example: "structured query language database administration"
 Avoid: "Uses Structured Query Language to administer relational databases."
 Remove filler verbs such as develops, implements, provides, generates, manages, responsible for.
-Skills should come from SKILLS/REQUIREMENTS/QUALIFICATIONS sections, however review the full document and suggest the skills required for this position.
+Skills should come from SKILLS/REQUIREMENTS/QUALIFICATIONS sections; also review the full document.
 Responsibilities should come from RESPONSIBILITIES/DUTIES/WHAT YOU’LL DO sections.
 Expand acronyms into their full professional terms (e.g., CRM → Customer Relationship Management, API → Application Programming Interface). Apply consistently.
 Ensure skills and responsibilities remain short, embedding-friendly phrases with no generic filler wording.
@@ -543,6 +676,73 @@ Output Format:
   ]
 }
 """
+# ===================================
+# ---- Optional JSON Schema lock ----
+# ===================================
+STRICT_SCHEMA_ENABLED = os.getenv("LLM_JSON_SCHEMA_STRICT", "0") not in {"0", "false", "False", ""}
+CV_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "cv_schema",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "doc_type", "name", "job_title", "years_of_experience",
+            "skills_sentences", "responsibility_sentences", "contact_info"
+        ],
+        "properties": {
+            "doc_type": {"type": "string", "const": "resume"},
+            "name": {"type": ["string", "null"]},
+            "job_title": {"type": ["string", "null"]},
+            "years_of_experience": {"type": ["number", "integer", "null"]},
+            "skills_sentences": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 20,
+                "maxItems": 20
+            },
+            "responsibility_sentences": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 10,
+                "maxItems": 10
+            },
+            "contact_info": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name"],
+                "properties": {"name": {"type": ["string", "null"]}}
+            }
+        }
+    }
+}
+JD_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "jd_schema",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "doc_type", "job_title", "years_of_experience",
+            "skills_sentences", "responsibility_sentences"
+        ],
+        "properties": {
+            "doc_type": {"type": "string", "const": "job_description"},
+            "job_title": {"type": ["string", "null"]},
+            "years_of_experience": {"type": ["number", "integer", "null"]},
+            "skills_sentences": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 20,
+                "maxItems": 20
+            },
+            "responsibility_sentences": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 10,
+                "maxItems": 10
+            }
+        }
+    }
+}
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -636,7 +836,6 @@ if "model_temp" not in st.session_state:
 # 🔽 NEW: Reasoning Effort (for GPT-5 models only)
 if "reasoning_effort" not in st.session_state:
     st.session_state.reasoning_effort = "minimal"
-
 # ---------------------------
 # OpenAI/Gemini call wrapper
 # ---------------------------
@@ -690,39 +889,45 @@ def _create_chat_completion(model_name, messages, response_format_json=True, tem
             dt = time.perf_counter() - t0
             return None, dt, str(e)
     
-    # Otherwise, use OpenAI
+    # Otherwise, use OpenAI with LLMService
     else:
-        if not OPENAI_API_KEY:
-            return None, 0.0, "OPENAI_API_KEY not found (set it in .env or Streamlit secrets)"
+        if not OPENAI_API_KEY or not llm_service:
+            return None, 0.0, "OPENAI_API_KEY not found or LLMService not initialized (set it in .env or Streamlit secrets)"
         
         try:
-            if CLIENT_AVAILABLE:
-                client = openai.Client(api_key=OPENAI_API_KEY)
-                kwargs = {"model": model_name, "messages": messages, "temperature": float(temperature)}
-
-                # 🔽 Apply reasoning_effort for GPT-5 models
-                if model_name.startswith("gpt-5"):
-                    kwargs["reasoning_effort"] = st.session_state.get("reasoning_effort", "minimal")
-
-                if response_format_json:
-                    kwargs["response_format"] = {"type": "json_object"}
-                resp = client.chat.completions.create(**kwargs)
-                dt = time.perf_counter() - t0
-                return resp, dt, None
-            elif LEGACY_AVAILABLE:
-                openai.api_key = OPENAI_API_KEY
-                kwargs = {"model": model_name, "messages": messages, "temperature": float(temperature)}
-                try:
-                    if response_format_json:
-                        kwargs["response_format"] = {"type": "json_object"}
-                    # Some legacy versions might ignore response_format
-                except Exception:
-                    pass
-                resp = openai.ChatCompletion.create(**kwargs)
-                dt = time.perf_counter() - t0
-                return resp, dt, None
-            else:
-                return None, 0.0, "openai SDK is not available in this environment"
+            # Determine which schema to use if strict mode is enabled
+            json_schema = None
+            if STRICT_SCHEMA_ENABLED:
+                # Check if we're extracting CV or JD based on the prompt content
+                prompt_content = " ".join([msg.get("content", "") for msg in messages])
+                if "resume" in prompt_content.lower() or "cv" in prompt_content.lower():
+                    json_schema = CV_JSON_SCHEMA
+                elif "job description" in prompt_content.lower() or "jd" in prompt_content.lower():
+                    json_schema = JD_JSON_SCHEMA
+            
+            # Use LLMService for OpenAI models
+            resp_data, dt, err = llm_service.chat_completion(
+                model=model_name,
+                messages=messages,
+                temperature=temperature,
+                json_schema=json_schema if response_format_json else None
+            )
+            
+            if err:
+                return None, dt, err
+            
+            # Convert response to the expected format
+            resp_obj = {
+                "choices": [{"message": {"content": resp_data["choices"][0]["message"]["content"]}}],
+                "usage": resp_data.get("usage", {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                })
+            }
+            
+            return resp_obj, dt, None
+            
         except Exception as e:
             dt = time.perf_counter() - t0
             return None, dt, str(e)
@@ -832,11 +1037,9 @@ with col1:
         <p class="hero-subtitle">BETA Version 1.0</p>
     </div>
     """, unsafe_allow_html=True)
-
     # 🔄 Refresh button centered below the header
     if st.button("🔄 Refresh", key="refresh_button"):
         reset_session_state()
-
 # ---------------------------
 # Session state init (rest)
 # ---------------------------
@@ -864,15 +1067,12 @@ if "prompts" not in st.session_state:
 # Tabs
 # ---------------------------
 tab1, tab2, tab3 = st.tabs(["⚙️ Customization", "📥 Upload & Extract", "📊 Results"])
-
 # =========================== TAB 1: CUSTOMIZATION ===========================
 with tab1:
     st.markdown("## 🔐 API Status")
-
     # 🔽 NEW: Model dropdown + automatic temp
     model_options = list(MODEL_PRESETS.keys())
     default_index = model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
-
     colA, colB = st.columns([1.5, 2])
     with colA:
         selected_model = st.selectbox("Select Model", model_options, index=default_index, key="model_name")
@@ -893,8 +1093,6 @@ with tab1:
             )
 
 
-
-
         # Add styled badge for provider
         model_type = "OpenAI" if not selected_model.startswith("gemini-") else "Gemini"
         badge_color = "#007bff" if model_type == "OpenAI" else "#ea4335"
@@ -909,16 +1107,13 @@ with tab1:
             """,
             unsafe_allow_html=True
         )
-
         st.metric("Temperature (auto)", f"{st.session_state.model_temp:.2f}")
-
     with colB:
         # API connection cards
         openai_ok_pkg = "✅" if OPENAI_AVAILABLE else "❌"
         openai_ok_key = "✅" if bool(OPENAI_API_KEY) else "❌"
         gemini_ok_pkg = "✅" if GEMINI_AVAILABLE else "❌"
         gemini_ok_key = "✅" if bool(GEMINI_API_KEY) else "❌"
-
         st.markdown(
             f"""
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-top:0.5rem;">
@@ -939,9 +1134,7 @@ with tab1:
             unsafe_allow_html=True
         )
 
-
   
-
     # Test API call button
     st.markdown("### 🧪 Test API Connection")
     if st.button("▶️ Run Test"):
@@ -986,7 +1179,6 @@ with tab1:
                         st.success(f"✅ Gemini is working! Usage: {_extract_usage(resp)}")
                 except Exception as e:
                     st.error(f"❌ Gemini call failed: {e}")
-
     st.markdown("---")
     st.subheader("📊 Weights")
     c1, c2, c3, c4 = st.columns(4)
